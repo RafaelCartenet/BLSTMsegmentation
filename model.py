@@ -1,30 +1,43 @@
 
-# Libraries
+# ML Libraries
 from sklearn.metrics import classification_report as CR
 from sklearn.metrics import confusion_matrix as CM
 import tensorflow as tf
+
+# Logger
+from logger import Logger
+
+# Global libraries
 import numpy as np
 import time
 import sys
 import os
 
+# Rafael Cartenet - 2018
 
-class GroupClassifier:
+
+""" Implementation of Bidirectionnal LSTM for framewise segmentation
+    of sequences of unfixed length
+"""
+
+
+class BLSTMSequenceSegmentation:
     def __init__(self,
                  models_path,   # path where will be save/restore models
                  model_name,    # name of the folder of models
-                 DEBUG=0,       # if 1, uses mini dataset
                  VERBOSE=1,     # if 1, prints additionnal informations
                  SAVE=1):       # if 1, save model after each epoch
-        self.DEBUG= DEBUG
         self.VERBOSE= VERBOSE
         self.SAVE= SAVE
         self.MODELS_PATH= models_path
         self.MODEL_NAME= model_name
         self.logger= Logger(VERBOSE)
+        self.max_length= 800    # Sequence max length for training
 
-        self.max_length= 800
 
+    ############################################################################
+    # DATA LOADING / PREPROCESSING
+    ############################################################################
     def load_data(self, X_train, Y_train, X_test, Y_test):
         self.X_train= np.asarray(X_train)
         self.Y_train= np.asarray(Y_train)
@@ -71,7 +84,6 @@ class GroupClassifier:
 
         # # Compute maximum length among samples
         # max_length= max([len(sample) for sample in np.concatenate((self.X_train, self.X_test), axis=0)])
-
 
         # Create np arrays for X and lengths
         X_train= np.zeros((nb_trainsamples, self.max_length, self.input_size), dtype='f')
@@ -129,12 +141,9 @@ class GroupClassifier:
         self.logger.write_log(logstring)
 
 
-    def extract_lasts(self, data, ind):
-        batch_range = tf.range(tf.shape(data)[0])
-        indices = tf.stack([batch_range, ind], axis=1)
-        return tf.gather_nd(data, indices)
-
-    #### Building Graph ####
+    ############################################################################
+    # TF GRAPH CONSTRUCTION
+    ############################################################################
     def build_graph(self,
             nb_hiddenunits=100,
             learning_rate=1e-4,
@@ -143,13 +152,22 @@ class GroupClassifier:
             dropoutwrapper=-1,
             FCL_size=30
         ):
+        """ Build the entire graph, from variables to optimizer to summaries
+        Each built is made separately so that they can be made independently
+        when needed.
+        """
+        # Variables
         self.build_graph_variables(
             nb_hiddenunits=nb_hiddenunits,
             fully_connected_layer_size=FCL_size,
             dropout=dropout,
             dropoutwrapper=dropoutwrapper
         )
+
+        # Optimizer
         self.build_graph_optimizer(learning_rate)
+
+        # Summaries
         self.build_graph_summaries(name)
 
         logstring=  '\nGRAPH VARIABLES SHAPES:\n'
@@ -169,10 +187,6 @@ class GroupClassifier:
             dropout,
             dropoutwrapper
         ):
-        """ Implementation of Bidirectionnal LSTM for framewise classification
-        of sequences of different lengths
-        """
-
         tf.reset_default_graph()
 
         with tf.variable_scope("groups"):
@@ -252,13 +266,14 @@ class GroupClassifier:
         accuracy/= tf.reduce_sum(mask, 1)
         return tf.reduce_mean(accuracy)
 
-    def build_graph_optimizer(self, learning_rate=1e-4,):
+    def build_graph_optimizer(self, learning_rate=1e-4):
         # Cross Entropy
         self.cross_entropy= self.cost(self.predictions, self.Y_)
 
         # Accuracy
         self.acc= self.accuracy(self.predictions, self.Y_)
 
+        # Weight Decay
         regularizer= tf.nn.l2_loss(self.W_f)
         self.loss= tf.reduce_mean(self.cross_entropy + .01*regularizer)
 
@@ -273,6 +288,9 @@ class GroupClassifier:
         self.summary_op = tf.summary.merge_all()
 
 
+    ############################################################################
+    # TRAINING
+    ############################################################################
     def train_model(self,
             keep_prob_inter,
             keep_prob_warp,
@@ -306,14 +324,16 @@ class GroupClassifier:
             epoch_time= time.time()
             epoch_acc= 0.
             epoch_loss= 0.
-            print "epo#%s\t|batch#\t|accu\t|loss\t|time\t|"% (epoch_id+1)
+            self.logger.write_log("epo#%s\t|batch#\t|accu\t|loss\t|time\t|"% (epoch_id+1))
             for batch_id in range(self.nb_batch_train):
                 batch_time= time.time()
 
-              # input
-                batch_X, batch_Y= self.X_train[batch_id], self.Y_train[batch_id]
+                # Get batch
+                batch_X= self.X_train[batch_id]
+                batch_Y= self.Y_train[batch_id]
                 lengths= self.lengths_train[batch_id]
-              # optimize and compute loss + accuracy
+
+                # Optimize model
                 _, loss, acc, summary= sess.run(
                     fetches= [
                         self.optimizer,
@@ -328,18 +348,17 @@ class GroupClassifier:
                         self.keep_prob_warp: keep_prob_warp
                     }
                 )
-              # update infos
+
+                # Update infos
                 epoch_acc+= acc;epoch_loss+= loss
                 batch_time= time.time()-batch_time
 
-              # display results
+                # Log results / Tensorboard
                 if batch_id % 30 == 0:
                     self.logger.write_log("\t|%s\t|%.2f%%\t|%.2f\t|%.2fs\t|"% (batch_id, 100*acc, loss, batch_time))
-
-              # write log to tensorboard
                 self.file_writer_train.add_summary(summary, epoch_id*self.nb_batch_train+ batch_id)
 
-            # update epoch infos
+            # Update tracking infos
             epoch_acc/= self.nb_batch_train
             epoch_loss/= self.nb_batch_train
             epoch_time= time.time()- epoch_time
@@ -357,10 +376,12 @@ class GroupClassifier:
             testing_loss= 0
             for batch_id in range(self.nb_batch_test):
 
-              # input
-                batch_X, batch_Y= self.X_test[batch_id], self.Y_test[batch_id]
+                # Get batch
+                batch_X= self.X_test[batch_id]
+                batch_Y= self.Y_test[batch_id]
                 lengths= self.lengths_test[batch_id]
-              # compute loss + accuracy
+
+                # Get loss and accuracy
                 loss, acc, summary= sess.run(
                     fetches= [
                         self.loss,
@@ -373,19 +394,28 @@ class GroupClassifier:
                         self.seq_lengths: lengths
                     }
                 )
-              # update infos
+
+                # Update global variables
                 testing_acc+= acc
                 testing_loss+= loss
 
-              # write log to tensorboard
+                # Log results / Tensorboard
                 self.file_writer_test.add_summary(summary, epoch_id*self.nb_batch_test+ batch_id)
 
+            # Update tracking infos
             testing_time= time.time()- testing_time
             testing_acc/= self.nb_batch_test
             testing_loss/= self.nb_batch_test
             self.logger.write_log("\t|TEST\t|%.2f%%\t|%.2f\t|%.2fs\t|\n"% (100*testing_acc, testing_loss, testing_time))
 
     def evaluate_model(self):
+        """ Evaluate the model.
+            Model is restored from models_path/model_name
+            If model could not be loaded, exits.
+            Data used for evaluation is the testing data.
+            Once the whole dataset is forwarded, classification report and
+            confusion matrix are computed
+        """
         # Initialize the variables
         sess= tf.Session()
         sess.run(tf.global_variables_initializer())
@@ -410,12 +440,12 @@ class GroupClassifier:
         for batch_id in range(self.nb_batch_test):
             batch_time= time.time()
 
-          # input
-            batch_X, batch_Y= self.X_test[batch_id], self.Y_test[batch_id]
+            # Get batch
+            batch_X= self.X_test[batch_id]
+            batch_Y= self.Y_test[batch_id]
             lengths= self.lengths_test[batch_id]
 
-
-          # compute loss + accuracy
+            # Get loss and accuracy
             loss, acc, predictions= sess.run(
                 fetches= [
                     self.loss,
@@ -428,7 +458,8 @@ class GroupClassifier:
                     self.seq_lengths: lengths
                 }
             )
-          # update infos
+
+          # Update global variables
             testing_acc+= acc
             testing_loss+= loss
 
@@ -440,7 +471,6 @@ class GroupClassifier:
                 pred= np.argmax(pred, axis=1)
                 Y_pred+= list(pred)
 
-
         testing_time= time.time()- testing_time
         testing_acc/= self.nb_batch_test
         testing_loss/= self.nb_batch_test
@@ -449,16 +479,27 @@ class GroupClassifier:
         Y_true= tophonetic(Y_true)
         Y_pred= tophonetic(Y_pred)
 
+        # Classification Report (CR)
         self.logger.write_log(CR(Y_true, Y_pred))
+
+        # Confusion Matrix (CM)
         mat= CM(Y_true, Y_pred)
-        groups= [group[:5] for group in sorted(self.labels)]
-        CONFMAT= "\t" + "\t".join(groups) + "\n"
+
+        # header line
+        CONFMAT= "\t"+"\t".join([lbl[:5] for lbl in sorted(self.labels)])+"\n"
+
         for i,phonetic in enumerate(sorted(self.labels)):
-            CONFMAT+= phonetic[:5] + "\t"+"\t".join(map(str, mat[i].tolist()+[np.sum(mat[i])])) + "\n\n"
-        CONFMAT+= "\t" + "\t".join(map(str, np.sum(mat, axis=0).tolist()))
+            CONFMAT+= phonetic[:5]+"\t"+"\t".join(map(str, mat[i].tolist()+[np.sum(mat[i])]))+"\n\n"
+
+        # footer line, sums
+        CONFMAT+= "\t"+"\t".join(map(str, np.sum(mat, axis=0).tolist()))
         self.logger.write_log(CONFMAT)
 
 
+
+    ############################################################################
+    # CALLABLE METHODS
+    ############################################################################
     def init_session(self):
         """ Method to inialize a new tensorflow session.
             From the model path and the model name given,
@@ -485,7 +526,6 @@ class GroupClassifier:
             print "Failed to restore BLSTM model: %s.\nEXIT."% (full_path_model)
             exit()
         return session
-
 
     def predict(self, session, data):
         """ Method to predict output from new samples, data.
@@ -518,42 +558,3 @@ class GroupClassifier:
         )
 
         return predictions
-
-
-def forward_test():
-    Clfr= GroupClassifier()
-    Clfr.load_data()
-    Clfr.arrange_data()
-    Clfr.build_graph()
-
-    sess= tf.Session()
-    sess.run(tf.global_variables_initializer())
-
-    X= Clfr.X_train[0]
-    Y= Clfr.Y_train[0]
-    lengths= Clfr.lengths_train[0]
-
-    outputs, predictions, acc, loss= sess.run(
-        [Clfr.X_, Clfr.predictions, Clfr.acc, Clfr.cross_entropy],
-        feed_dict={
-            Clfr.X_: X,
-            Clfr.Y_: Y,
-            Clfr.seq_lengths: lengths,
-        }
-    )
-
-    print "\nPREDICTIONS\n", predictions
-    print "\nOUTPUTS\n", outputs
-    print "\nREAL LABELS\n", Y
-    print "\nACCURACY\n%.2f%%"% acc
-    print "\nLOSS\n%s"% loss
-
-    print Y[0][50]
-    print predictions[0][50]
-
-if __name__ == "__main__":
-    start= time.time()
-    forward_test()
-    assert()
-
-    print 'Running time: %.2f' % (time.time() - start)
